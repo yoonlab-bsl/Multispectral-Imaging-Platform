@@ -1,0 +1,506 @@
+"""
+Multispectral Imaging Platform (MIP) Control Software
+
+Operates a low-cost multispectral imaging system built around a Raspberry Pi 4
+Model B and Pi Camera Module 3 NoIR. Controls a servo-driven 13-position
+filter wheel, 4-channel LED illumination (R/G/B/UV), XY sample stage with two
+NEMA 11 linear actuators, and automated image to CSV processing.
+
+Anthropic Claude Opus 4.6 was utilized for the purposes of code generation, debugging, and optimization.
+"""
+
+import time, sys, os, numpy as np, pandas as pd, pigpio, RPi.GPIO as GPIO
+os.environ["LIBCAMERA_LOG_LEVELS"] = "ERROR"
+from pathlib import Path
+from datetime import datetime
+from PIL import Image
+from pynput import keyboard
+from math import gcd
+
+# ============================================================
+# Hardware Configuration Constants
+# ============================================================
+
+# Servo (filter wheel) — bit-banged UART to Arduino Nano
+SERVO_PIN = 17                          # BCM pin to Arduino Nano RX
+BAUD_RATE = 9600
+BIT_US = 1000000 // BAUD_RATE          # Microseconds per bit
+PULSE_MIN, PULSE_MAX = 500, 2500       # Servo pulse range (µs)
+
+# LED illumination (active-low via MPS2222A NPN transistors)
+LED_PINS = {'R': 26, 'G': 19, 'B': 13, 'UV': 6}
+LED_ORDER = ['R', 'G', 'B', 'UV']
+
+# Filter wheel: 13 positions (neutral + 12 Roscolux filters)
+FILTER_PULSES = [500, 690, 820, 970, 1120, 1240, 1420,
+                 1580, 1720, 1880, 2030, 2170, 2290]
+FILTER_LABELS = ['N','a','b','c','d','e','f','g','h','i','j','k','l']
+HOME_PULSE = FILTER_PULSES[0]
+SERVO_SETTLE = 0.2                     # Seconds after servo move
+NUM_VIEWS = 12
+
+# X-axis stepper (NEMA 11 100mm actuator, A4988 driver)
+MOTOR_X = {'dir': 15, 'step': 14, 'en': 18}
+MX_PULSE, MX_GAP, MX_USTEPS = 60, 60, 8
+
+# Y-axis stepper (NEMA 11 50mm actuator, TMC2209 driver)
+MOTOR_Y = {'dir': 4, 'step': 3, 'slp': 2}
+MY_PULSE = 500
+
+# Camera (Pi Camera Module 3 NoIR, Sony IMX708)
+SENSOR_W, SENSOR_H = 4608, 2592
+ZOOM_LEVELS = [1, 5, 10, 12, 13, 14, 15]
+PREV_W, PREV_H = 640, 360
+EXPOSURE_US, ANA_GAIN = 150000, 1.0
+WB_RED, WB_BLUE, LENS_POS = 1.4, 1.8, 10.2
+FIXED_CONTROLS = {
+    "AeEnable": False, "AwbEnable": False, "AfMode": 0,
+    "Brightness": 0.0, "Contrast": 1.0, "Saturation": 1.0,
+    "Sharpness": 0.0, "NoiseReductionMode": 0,
+}
+
+OUTPUT_DIR = Path.home() / "mnp_data"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ============================================================
+# Camera Helpers
+# ============================================================
+
+def zoom_crop(z):
+    """Compute ScalerCrop rectangle for a given digital zoom factor."""
+    cw, ch = SENSOR_W // z, SENSOR_H // z
+    return ((SENSOR_W - cw) // 2, (SENSOR_H - ch) // 2, cw, ch)
+
+def cam_controls(z=10):
+    """Build full camera controls dict for a given zoom level."""
+    return {**FIXED_CONTROLS, "ScalerCrop": zoom_crop(z), "ExposureTime": EXPOSURE_US,
+            "AnalogueGain": ANA_GAIN, "ColourGains": (WB_RED, WB_BLUE), "LensPosition": LENS_POS}
+
+# ============================================================
+# Waveform Generation for Stepper Motors
+# ============================================================
+
+def build_wave(pi, x_on, y_on):
+    """Build a pigpio DMA waveform for simultaneous X/Y stepper stepping."""
+    if not x_on and not y_on:
+        return None
+
+    mx_us = MX_PULSE + MX_GAP          # X full step period
+    my_us = MY_PULSE * 2               # Y full step period
+
+    if x_on and y_on:
+        g = gcd(mx_us, my_us); base = g
+        mx_t, my_t = mx_us // base, my_us // base
+        lcm = (mx_t * my_t) // gcd(mx_t, my_t)
+        if lcm > 5000: lcm = 5000
+    elif x_on:
+        base, mx_t, my_t, lcm = mx_us, 1, 1, 1
+    else:
+        base, mx_t, my_t, lcm = my_us, 1, 1, 1
+
+    half = max(1, base // 2)
+    pulses = []
+    for t in range(lcm):
+        on, off = 0, 0
+        if x_on and (t % mx_t == 0): on |= (1 << MOTOR_X['step'])
+        else: off |= (1 << MOTOR_X['step'])
+        if y_on and (t % my_t == 0): on |= (1 << MOTOR_Y['step'])
+        else: off |= (1 << MOTOR_Y['step'])
+        pulses.append(pigpio.pulse(on, off, half))
+        pulses.append(pigpio.pulse(0, on, base - half))
+
+    pi.wave_add_generic(pulses)
+    return pi.wave_create()
+
+# ============================================================
+# Servo Class — Bit-Banged UART to Arduino Nano
+# ============================================================
+
+class Servo:
+    """Sends pulse-width commands to an Arduino Nano via bit-banged serial at 9600 baud.
+    The Nano translates ASCII pulse values into PWM for an MG90D servo on the filter wheel."""
+
+    def __init__(self, pi, pin):
+        self.pi, self.pin = pi, pin
+        pi.set_mode(pin, pigpio.OUTPUT)
+        pi.write(pin, 1)
+        time.sleep(0.1)
+        self.send(PULSE_MIN)
+        time.sleep(0.5)
+
+    def send(self, pulse_us):
+        """Transmit a pulse-width value as 8N1 UART using pigpio waveforms."""
+        pulse_us = max(PULSE_MIN, min(PULSE_MAX, pulse_us))
+        wf = []
+        for byte in f"{pulse_us}\n".encode():
+            wf.append(pigpio.pulse(0, 1 << self.pin, BIT_US))             # Start bit
+            for i in range(8):                                              # 8 data bits LSB-first
+                on, off = (1 << self.pin, 0) if byte & (1 << i) else (0, 1 << self.pin)
+                wf.append(pigpio.pulse(on, off, BIT_US))
+            wf.append(pigpio.pulse(1 << self.pin, 0, BIT_US))             # Stop bit
+
+        self.pi.wave_clear()
+        self.pi.wave_add_generic(wf)
+        w = self.pi.wave_create()
+        self.pi.wave_send_once(w)
+        while self.pi.wave_tx_busy():
+            time.sleep(0.001)
+        self.pi.wave_delete(w)
+
+# ============================================================
+# XY Stage Class — Dual Stepper Motor Control
+# ============================================================
+
+class Stage:
+    """Keyboard-joggable XY stage using two NEMA 11 linear actuators with DMA waveforms."""
+
+    def __init__(self, pi):
+        self.pi = pi
+        self.step_x, self.step_y = 0, 0
+        self.wid, self.wave_start = None, None
+        self.x_on, self.y_on = False, False
+        self.x_dir, self.y_dir = 0, 0
+
+        for p in [MOTOR_X['dir'], MOTOR_X['step'], MOTOR_X['en'],
+                  MOTOR_Y['dir'], MOTOR_Y['step'], MOTOR_Y['slp']]:
+            pi.set_mode(p, pigpio.OUTPUT)
+        self.pi.write(MOTOR_X['en'], 1)    # X disabled
+        self.pi.write(MOTOR_Y['slp'], 0)   # Y sleeping
+        for p in [MOTOR_X['dir'], MOTOR_X['step'], MOTOR_Y['dir'], MOTOR_Y['step']]:
+            pi.write(p, 0)
+
+        self.keys = {keyboard.Key.right: False, keyboard.Key.left: False,
+                     keyboard.Key.up: False, keyboard.Key.down: False}
+
+    def _flush(self):
+        """Stop active waveform and update position estimate from elapsed time."""
+        if self.wid is None or self.wave_start is None: return
+        elapsed = time.time() - self.wave_start
+        mx_us, my_us = MX_PULSE + MX_GAP, MY_PULSE * 2
+        if self.x_on and self.x_dir != 0:
+            self.step_x += int(elapsed * 1e6 / mx_us / MX_USTEPS) * self.x_dir
+        if self.y_on and self.y_dir != 0:
+            self.step_y += int(elapsed * 1e6 / my_us) * self.y_dir
+        self.pi.wave_tx_stop()
+        try: self.pi.wave_delete(self.wid)
+        except: pass
+        self.wid, self.wave_start = None, None
+
+    def _update(self):
+        """Recalculate motor state from keyboard input and restart waveforms as needed."""
+        xd = 1 if self.keys[keyboard.Key.right] else (-1 if self.keys[keyboard.Key.left] else 0)
+        yd = 1 if self.keys[keyboard.Key.down] else (-1 if self.keys[keyboard.Key.up] else 0)
+        nx, ny = (xd != 0), (yd != 0)
+        if xd == self.x_dir and yd == self.y_dir and nx == self.x_on and ny == self.y_on:
+            return
+        self._flush()
+        self.x_dir, self.y_dir, self.x_on, self.y_on = xd, yd, nx, ny
+        self.pi.write(MOTOR_X['dir'], 0 if xd >= 0 else 1)
+        self.pi.write(MOTOR_Y['dir'], 1 if yd >= 0 else 0)
+        self.pi.write(MOTOR_X['en'], 0 if nx else 1)
+        self.pi.write(MOTOR_Y['slp'], 1 if ny else 0)
+        if nx or ny:
+            time.sleep(0.002)
+            self.pi.wave_clear()
+            self.wid = build_wave(self.pi, nx, ny)
+            if self.wid is not None and self.wid >= 0:
+                self.wave_start = time.time()
+                self.pi.wave_send_repeat(self.wid)
+
+    def _press(self, key):
+        if key in self.keys and not self.keys[key]:
+            self.keys[key] = True; self._update()
+
+    def _release(self, key):
+        if key in self.keys:
+            self.keys[key] = False; self._update()
+
+    def stop_waves(self):
+        """Stop all waveforms and disable both motor drivers."""
+        self._flush(); self.pi.wave_clear()
+        self.pi.write(MOTOR_X['en'], 1); self.pi.write(MOTOR_Y['slp'], 0)
+        self.x_on = self.y_on = False; self.x_dir = self.y_dir = 0
+
+    def move_steps(self, dx, dy):
+        """Move stage by (dx, dy) steps using DMA waveforms."""
+        ax, ay = abs(dx) * MX_USTEPS, abs(dy)
+        if ax == 0 and ay == 0: return
+        self.stop_waves()
+        self.pi.write(MOTOR_X['en'], 0); self.pi.write(MOTOR_Y['slp'], 1)
+        time.sleep(0.002)
+        self.pi.write(MOTOR_X['dir'], 0 if dx >= 0 else 1)
+        self.pi.write(MOTOR_Y['dir'], 1 if dy >= 0 else 0)
+        time.sleep(0.002)
+
+        mx_us, my_us = MX_PULSE + MX_GAP, MY_PULSE * 2
+        xt, yt = ax * mx_us, ay * my_us
+
+        def _run_wave(x, y, duration_us):
+            self.pi.wave_clear()
+            w = build_wave(self.pi, x, y)
+            if w is not None and w >= 0:
+                self.pi.wave_send_repeat(w)
+                time.sleep(duration_us / 1e6 + 0.005)
+                self.pi.wave_tx_stop(); self.pi.wave_delete(w)
+            self.pi.wave_clear()
+
+        if ax > 0 and ay > 0:
+            short = min(xt, yt)
+            _run_wave(True, True, short)
+            if xt > yt:   _run_wave(True, False, xt - yt)
+            elif yt > xt: _run_wave(False, True, yt - xt)
+        elif ax > 0: _run_wave(True, False, xt)
+        elif ay > 0: _run_wave(False, True, yt)
+
+        self.step_x += dx; self.step_y += dy
+        self.pi.write(MOTOR_X['en'], 1); self.pi.write(MOTOR_Y['slp'], 0)
+
+    def move_to(self, tx, ty):
+        dx, dy = tx - self.step_x, ty - self.step_y
+        if dx or dy: self.move_steps(dx, dy)
+
+    def home(self): self.move_to(0, 0)
+
+    def off(self):
+        self.stop_waves()
+        self.pi.write(MOTOR_X['en'], 1); self.pi.write(MOTOR_Y['slp'], 0)
+
+# ============================================================
+# Image Analysis
+# ============================================================
+
+def block_means(img_array, n=3):
+    """Divide image into n×n grid, return per-block RGB means as (n², 4) array."""
+    img = img_array
+    if img.ndim == 2: img = np.stack([img] * 3, axis=-1)
+    f = img.astype(np.float32) / 255.0 if img.dtype not in (np.float32, np.float64) \
+        else img.astype(np.float32)
+    h, w = f.shape[:2]; rh, cw_px = h // n, w // n
+    rows = []
+    for r in range(n):
+        for c in range(n):
+            r0, c0 = r * rh, c * cw_px
+            r1 = (r + 1) * rh if r < n - 1 else h
+            c1 = (c + 1) * cw_px if c < n - 1 else w
+            p = f[r0:r1, c0:c1, :]
+            rows.append([p[..., 0].mean(), p[..., 1].mean(), p[..., 2].mean(), r * n + c])
+    return np.array(rows)
+
+def clean_label(x):
+    """Normalize illumination label to canonical form (R/G/B/UV)."""
+    s = str(x).strip().lower()
+    return {'g':'G','green':'G','b':'B','blue':'B','r':'R','red':'R','uv':'UV','u':'UV'}.get(s, s.upper())
+
+def compute_ratio_pivot(buf_df, plastic, view):
+    """Compute inter-channel spectral ratios and pivot into wide-format feature matrix."""
+    data = buf_df.copy()
+    data['Light'] = data['Light'].apply(clean_label)
+    lights = list(pd.unique(data['Light']))
+    dominant = {'G': 'G', 'B': 'B', 'R': 'R', 'UV': 'B'}
+    data_clean = data.dropna()
+    merged = pd.DataFrame()
+
+    for L in lights:
+        df = data_clean[data_clean['Light'] == L].copy()
+        dn = dominant.get(L)
+        if df.empty or dn not in ['R', 'G', 'B']: continue
+        ratio_cols = []
+        for ch in ['R', 'G', 'B']:
+            if ch != dn:
+                col = f"{L}_{ch}/{dn}"
+                df.loc[:, col] = df[ch] / df[dn]
+                ratio_cols.append(col)
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        df = df.loc[:, ['Sample', 'Filter', 'Repeat', 'Block'] + ratio_cols].reset_index(drop=True)
+        merged = df if merged.empty else merged.merge(
+            df, on=['Sample', 'Filter', 'Repeat', 'Block'], how='inner')
+
+    if merged.empty: return None
+
+    merged = merged.pivot_table(index=['Sample', 'Repeat', 'Block'], columns='Filter')
+    merged.columns = ["_".join((i, j)) for i, j in merged.columns]
+    merged = merged.reset_index(names=['Sample', 'Repeat', 'Block'])
+    merged = merged.drop(columns=['Block']).rename(columns={'Sample': 'Class'})
+    merged.replace([np.inf, -np.inf], np.nan, inplace=True)
+    before = len(merged); merged.dropna(inplace=True)
+    if before - len(merged) > 0: print(f"    Dropped {before - len(merged)} NaN rows")
+    merged['Repeat'] = pd.to_numeric(merged['Repeat'], errors='coerce')
+    return merged.rename(columns={'Repeat': 'View'}).sort_values('View').reset_index(drop=True)
+
+# ============================================================
+# LED Control
+# ============================================================
+
+def setup_leds():
+    GPIO.setmode(GPIO.BCM); GPIO.setwarnings(False)
+    for pin in LED_PINS.values(): GPIO.setup(pin, GPIO.OUT); GPIO.output(pin, GPIO.LOW)
+
+def led_on(name):  GPIO.output(LED_PINS[name], GPIO.HIGH)
+def led_off(name): GPIO.output(LED_PINS[name], GPIO.LOW)
+def all_leds_off():
+    for pin in LED_PINS.values(): GPIO.output(pin, GPIO.LOW)
+
+# ============================================================
+# Camera Initialization and Mode Switching
+# ============================================================
+
+def init_camera():
+    """Initialize Pi Camera Module 3 NoIR with preview configuration."""
+    from picamera2 import Picamera2, Preview
+    cam = Picamera2(); ctrl = cam_controls(1)
+    cfg = cam.create_preview_configuration(main={"size": (PREV_W, PREV_H)}, controls=ctrl)
+    cam.configure(cfg)
+    cam.start_preview(Preview.QTGL, width=PREV_W, height=PREV_H)
+    cam.start(); time.sleep(2); cam.set_controls(ctrl); time.sleep(0.5)
+    return cam
+
+def set_zoom(cam, z): cam.set_controls({"ScalerCrop": zoom_crop(z)})
+
+def switch_to_capture(cam, z):
+    """Reconfigure camera from preview to full-resolution still capture."""
+    cam.stop_preview(); cam.stop(); ctrl = cam_controls(z)
+    cfg = cam.create_still_configuration(
+        main={"size": (SENSOR_W // z, SENSOR_H // z), "format": "RGB888"}, controls=ctrl)
+    cam.configure(cfg); cam.start(); time.sleep(1); cam.set_controls(ctrl); time.sleep(0.5)
+
+# ============================================================
+# Capture Pipeline
+# ============================================================
+
+def capture_view(cam, servo, plastic, view, img_dir, zoom):
+    """Capture full multispectral set (13 filters × 4 LEDs) for one sample view."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    buf_path = OUTPUT_DIR / f"buf_{plastic}_V{view}_{ts}.csv"
+    pd.DataFrame(columns=['R','G','B','Block','Sample','Light','Filter','Repeat']) \
+        .to_csv(buf_path, index=False)
+
+    count, total = 0, len(FILTER_LABELS) * len(LED_ORDER)
+    for pulse, filt in zip(FILTER_PULSES, FILTER_LABELS):
+        servo.send(pulse); time.sleep(SERVO_SETTLE)
+        for led in LED_ORDER:
+            count += 1
+            path = img_dir / f"{plastic}_{led}_{filt}_{view}.png"
+            led_on(led); time.sleep(0.01); cam.capture_file(str(path)); led_off(led)
+            rgb = block_means(np.array(Image.open(path)))
+            df = pd.DataFrame(rgb, columns=['R', 'G', 'B', 'Block'])
+            df['Sample'], df['Light'], df['Filter'], df['Repeat'] = plastic, led, filt, view
+            df.to_csv(buf_path, mode='a', header=False, index=False)
+            print(f"  [{count}/{total}] {path.name}")
+
+    servo.send(HOME_PULSE); time.sleep(SERVO_SETTLE)
+    result = compute_ratio_pivot(pd.read_csv(buf_path), plastic, view)
+    if buf_path.exists(): buf_path.unlink()
+    return result
+
+# ============================================================
+# Teach Mode — Interactive View Position Selection
+# ============================================================
+
+def teach(stage, cam, num_views):
+    """Arrow keys to jog, SPACE to log position, Z to cycle zoom, ESC to abort."""
+    positions, done, abort, zi, ready = [], [False], [False], [0], [False]
+    print(f"\n  TEACH MODE — {num_views} views")
+    print(f"  Arrows=jog, SPACE=log, Z=zoom, ESC=abort\n  Zoom: {ZOOM_LEVELS[0]}x\n")
+
+    def on_press(key):
+        if key == keyboard.Key.space:
+            if not done[0]:
+                stage.stop_waves()
+                pos = (stage.step_x, stage.step_y); positions.append(pos)
+                v = len(positions)
+                print(f"\n  V{v} at ({pos[0]},{pos[1]}) [{v}/{num_views}] zoom={ZOOM_LEVELS[zi[0]]}x")
+                if v >= num_views:
+                    done[0] = True
+                    print(f"\n  All {num_views} views logged. Z=zoom, SPACE=start")
+            else:
+                ready[0] = True; return False
+        elif key == keyboard.Key.esc:
+            abort[0] = True; return False
+        elif hasattr(key, 'char') and key.char == 'z':
+            zi[0] = (zi[0] + 1) % len(ZOOM_LEVELS)
+            set_zoom(cam, ZOOM_LEVELS[zi[0]])
+            print(f"\n  Zoom: {ZOOM_LEVELS[zi[0]]}x")
+        elif not done[0]:
+            stage._press(key)
+
+    def on_release(key):
+        if not done[0]: stage._release(key)
+
+    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+        listener.join()
+    stage.stop_waves()
+
+    if abort[0]: print("  Aborted."); return None, None
+    if not ready[0]: print("  Incomplete."); return None, None
+    fz = ZOOM_LEVELS[zi[0]]
+    for i, (px, py) in enumerate(positions): print(f"    V{i+1}: ({px},{py})")
+    print(f"  Capture zoom: {fz}x")
+    return positions, fz
+
+# ============================================================
+# Main Entry Point
+# ============================================================
+
+def run():
+    """Run a complete MIP data collection session."""
+    plastic = input("Enter plastic class name: ").strip()
+    if not plastic: print("ERROR: empty name."); return
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = OUTPUT_DIR / f"{plastic}.csv"
+    img_dir = OUTPUT_DIR / plastic; img_dir.mkdir(parents=True, exist_ok=True)
+
+    pi = pigpio.pi()
+    if not pi.connected: print("ERROR: pigpiod not running."); return
+    servo = Servo(pi, SERVO_PIN); stage = Stage(pi)
+    setup_leds(); cam = init_camera()
+    servo.send(HOME_PULSE); time.sleep(SERVO_SETTLE)
+    views = []
+
+    try:
+        positions, cap_zoom = teach(stage, cam, NUM_VIEWS)
+        if not positions or len(positions) < NUM_VIEWS: stage.home(); return
+        switch_to_capture(cam, cap_zoom)
+        for i in range(NUM_VIEWS - 1, -1, -1):
+            stage.move_to(*positions[i])
+            vdf = capture_view(cam, servo, plastic, i + 1, img_dir, cap_zoom)
+            if vdf is not None: views.append(vdf)
+        stage.home()
+        if views:
+            final = pd.concat(views, ignore_index=True).sort_values('View').reset_index(drop=True)
+            if csv_path.exists():
+                existing = pd.read_csv(csv_path)
+                if set(existing.columns) == set(final.columns):
+                    final = pd.concat([existing, final], ignore_index=True)
+                else: csv_path = OUTPUT_DIR / f"{plastic}_{ts}.csv"
+            final.to_csv(csv_path, index=False)
+            n_img = sum(1 for _ in img_dir.glob('*.png'))
+            print(f"\n  Saved: {csv_path}  shape={final.shape}")
+            print(f"  Views: {sorted(final['View'].unique())}\n  Images: {n_img}")
+
+    except KeyboardInterrupt:
+        print("\n\nInterrupted!")
+        if views:
+            pd.concat(views, ignore_index=True).to_csv(
+                OUTPUT_DIR / f"{plastic}_partial_{ts}.csv", index=False)
+        try: servo.send(HOME_PULSE)
+        except: pass
+        try: stage.home()
+        except: pass
+
+    except Exception as e:
+        print(f"\n\nERROR: {e}"); import traceback; traceback.print_exc()
+        if views:
+            pd.concat(views, ignore_index=True).to_csv(
+                OUTPUT_DIR / f"{plastic}_partial_{ts}.csv", index=False)
+        try: servo.send(HOME_PULSE)
+        except: pass
+        try: stage.home()
+        except: pass
+
+    finally:
+        all_leds_off(); stage.off()
+        if cam: cam.stop(); cam.close()
+        pi.stop(); GPIO.cleanup(); print("Done.")
+
+if __name__ == "__main__":
+    run()
